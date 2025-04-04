@@ -27,7 +27,7 @@ print(f'Dataset Info:\n'
 
 # 邻居采样配置
 kwargs = {
-    'batch_size': 512,        # 减小batch_size适应显存
+    'batch_size': 1024,        # 减小batch_size适应显存
     'num_workers': 4,
     'persistent_workers': True
 }
@@ -41,95 +41,123 @@ train_loader = NeighborLoader(
 
 # 全图推理加载器
 subgraph_loader = NeighborLoader(
-    copy.copy(data),
+    copy.copy(data),   # 强制数据在GPU上。
     input_nodes=None,
     num_neighbors=[10,10],       # 使用全图邻居
     shuffle=False,
     **kwargs
 )
+
 del subgraph_loader.data.x, subgraph_loader.data.y
 subgraph_loader.data.num_nodes = data.num_nodes
 subgraph_loader.data.n_id = torch.arange(data.num_nodes)
 
-# 模型定义
-class FlickrSAGE(torch.nn.Module):
+
+class SAGE(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
-        self.convs = torch.nn.ModuleList([
-            SAGEConv(in_channels, 512),    # 增大第一层维度
-            SAGEConv(512, 256),
-            SAGEConv(256, out_channels)    # 增加第三层
-        ])
-        self.dropout = 0.3
+        self.convs = torch.nn.ModuleList()
+        self.convs.append(SAGEConv(in_channels, hidden_channels))
+        self.convs.append(SAGEConv(hidden_channels, out_channels))
 
     def forward(self, x, edge_index):
-        for i, conv in enumerate(self.convs[:-1]):
-            x = conv(x, edge_index).relu_()
-            x = F.dropout(x, p=self.dropout, training=self.training)
-        return self.convs[-1](x, edge_index)
+        for i, conv in enumerate(self.convs):
+            x = conv(x, edge_index)
+            if i < len(self.convs) - 1:
+                x = x.relu_()
+                x = F.dropout(x, p=0.5, training=self.training)
+        return x
 
     @torch.no_grad()
     def inference(self, x_all, subgraph_loader):
-        for conv in self.convs[:-1]:
+        pbar = tqdm(total=len(subgraph_loader.dataset) * len(self.convs))
+        pbar.set_description('Evaluating')
+
+        # Compute representations of nodes layer by layer, using *all*
+        # available edges. This leads to faster computation in contrast to
+        # immediately computing the final representations of each batch:
+        for i, conv in enumerate(self.convs):
             xs = []
             for batch in subgraph_loader:
-                x = x_all[batch.n_id.to(x_all.device)]
-                x = conv(x, batch.edge_index.to(device)).relu_()
+                x = x_all[batch.n_id.to(x_all.device)].to(device)
+                x = conv(x, batch.edge_index.to(device))
+                if i < len(self.convs) - 1:
+                    x = x.relu_()
                 xs.append(x[:batch.batch_size].cpu())
+                pbar.update(batch.batch_size)
             x_all = torch.cat(xs, dim=0)
-        return self.convs[-1](x_all.to(device), torch.zeros(1).to(device))  # 最后层GPU计算
+        pbar.close()
+        return x_all
+    
 
 # 初始化模型
-model = FlickrSAGE(
-    in_channels=500,          # Flickr特征维度
+model = SAGE(
+    in_channels=dataset.num_features,          # Flickr特征维度
     hidden_channels=512,
-    out_channels=7            # 类别数
+    out_channels=dataset.num_classes            # 类别数
 ).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
 
 # 训练循环
+
 def train(epoch):
     model.train()
-    total_loss = 0
-    pbar = tqdm(train_loader, desc=f'Epoch {epoch:02d}')
     
-    for batch in pbar:
+
+    pbar = tqdm(total=int(len(train_loader.dataset)))
+    pbar.set_description(f'Epoch {epoch:02d}')
+
+    total_loss = total_correct = total_examples = 0
+    for batch in train_loader:
         optimizer.zero_grad()
-        out = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
-        loss = F.cross_entropy(out, batch.y[:batch.batch_size])
+        y = batch.y[:batch.batch_size]
+        y_hat = model(batch.x, batch.edge_index.to(device))[:batch.batch_size]
+        loss = F.cross_entropy(y_hat, y)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 梯度裁剪
         optimizer.step()
-        total_loss += loss.item()
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    return total_loss / len(train_loader)
+
+        total_loss += float(loss) * batch.batch_size
+        total_correct += int((y_hat.argmax(dim=-1) == y).sum())
+        total_examples += batch.batch_size
+        pbar.update(batch.batch_size)
+    pbar.close()
+
+    return total_loss / total_examples, total_correct / total_examples
 
 @torch.no_grad()
 def test():
     model.eval()
-    out = model.inference(data.x, subgraph_loader)[0]
-    y_pred = out.argmax(dim=-1)
-    y_true = data.y.to(device)
-    
+    y_hat = model.inference(data.x, subgraph_loader).argmax(dim=-1)
+    y = data.y.to(y_hat.device)
+
     accs = []
     for mask in [data.train_mask, data.val_mask, data.test_mask]:
-        acc = (y_pred[mask] == y_true[mask]).sum().item() / mask.sum().item()
-        accs.append(acc)
+        accs.append(int((y_hat[mask] == y[mask]).sum()) / int(mask.sum()))
     return accs
 
-# 训练配置
-best_val_acc = 0
-for epoch in range(1, 20):
-    train_loss = train(epoch)
+times = []
+max_acc = 0.0
+for epoch in range(1, 2):
+    start = time.time()
+    loss, acc = train(epoch)
+    print(f'Epoch {epoch:02d}, Loss: {loss:.4f}, Approx. Train: {acc:.4f}')
     train_acc, val_acc, test_acc = test()
-    
-    # 保存最佳模型
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        torch.save(model.state_dict(), f'flickr_sage_best_{epoch}.pth')
-    
-    print(f'Epoch {epoch:03d} | Loss: {train_loss:.4f} | '
-          f'Train: {train_acc:.4f} | Val: {val_acc:.4f} | Test: {test_acc:.4f}')
+    print(f'Epoch: {epoch:02d}, Train: {train_acc:.4f}, Val: {val_acc:.4f}, '
+          f'Test: {test_acc:.4f}')
+    times.append(time.time() - start)
 
-print(f'Best Validation Accuracy: {best_val_acc:.4f}')
+    # 对于每个epoch都保存一次model_state_dict，最终只保存精度最高的那个。
+    
+    if acc > max_acc:
+        max_acc = acc
+        # 保存路径
+        print(kwargs['batch_size'])
+        model_save_path = osp.join(osp.dirname(osp.realpath(__file__)),f"flickr_graphSAGE_{kwargs['batch_size']}.pth")
+        print(model_save_path)
+        torch.save(model.state_dict(),model_save_path)
+        
+
+        print('new model state dict has saved!')
+ 
+
+print(f"Median time per epoch: {torch.tensor(times).median():.4f}s")
